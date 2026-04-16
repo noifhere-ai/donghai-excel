@@ -1,0 +1,41 @@
+# Python
+.venv/
+venv/
+ENV/
+env/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Data
+*.zip
+*.rar
+*.log
+script_output.log
+*.xlsx
+*.xls
+*.csv
+*.xlsm
+
+# IDE
+.vscode/
+.idea/
