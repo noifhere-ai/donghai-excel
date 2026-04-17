@@ -1,0 +1,196 @@
+import polars as pl
+import re
+from pathlib import Path
+import xlsxwriter
+
+# ---------------------------------------------------------
+# 1. 统一字段清洗与强制浮点数安全
+# ---------------------------------------------------------
+
+def clean_polars_headers(df: pl.DataFrame, expected_headers: list[str]) -> pl.DataFrame:
+    """
+    统一字段清洗：大小写不敏感，去冗余空格
+    防止因业务人员导出的表格列头存在隐藏空格导致 Left Join 失败
+    """
+    expected_map = {re.sub(r"\s+", " ", str(h)).strip().lower(): h for h in expected_headers}
+    rename_map = {}
+    
+    for col in df.columns:
+        norm_col = re.sub(r"\s+", " ", str(col)).strip().lower()
+        if norm_col in expected_map:
+            rename_map[col] = expected_map[norm_col]
+            
+    # 只保留预期的列并重命名，防止无关列污染内存
+    return df.rename(rename_map).select([col for col in rename_map.values() if col in df.columns])
+
+def enforce_financial_floats(df: pl.DataFrame, float_cols: list[str]) -> pl.DataFrame:
+    """
+    强制浮点数计算安全：遇杂乱字符串转为 Null 并 Fill 0.0
+    """
+    exist_cols = [c for c in float_cols if c in df.columns]
+    if not exist_cols:
+        return df
+        
+    return df.with_columns([
+        pl.col(c).cast(pl.Float64, strict=False).fill_null(0.0)
+        for c in exist_cols
+    ])
+
+# ---------------------------------------------------------
+# 2. 回款单读取与向量化聚合 (替代 build_payout_summary)
+# ---------------------------------------------------------
+
+def build_payout_pipeline(payout_files: list, valid_order_ids: set[str], payout_headers: list, fee_aliases: dict):
+    dfs = []
+    
+    # 使用 calamine 引擎极速读取
+    for f in payout_files:
+        df = pl.read_excel(f.path, engine="calamine", sheet_name="Order details")
+        df = clean_polars_headers(df, payout_headers)
+        df = df.with_columns(pl.lit(f.store_label).alias("店铺"))
+        dfs.append(df)
+        
+    # diagonal_relaxed 允许各表列不完全一致时自动补充 Null
+    payout_df = pl.concat(dfs, how="diagonal_relaxed")
+    
+    fee_columns = list(fee_aliases.values())
+    payout_df = enforce_financial_floats(payout_df, ["Total settlement amount"] + fee_columns)
+    
+    # 向量化解析 Order ID 归属关系
+    valid_ids_series = pl.Series(list(valid_order_ids))
+    payout_df = payout_df.with_columns(
+        pl.when(pl.col("Related order ID").is_not_null() & pl.col("Related order ID").is_in(valid_ids_series))
+        .then(pl.col("Related order ID"))
+        .when(pl.col("Order/adjustment ID").is_not_null() & pl.col("Order/adjustment ID").is_in(valid_ids_series))
+        .then(pl.col("Order/adjustment ID"))
+        .otherwise(None)
+        .alias("Target Order ID")
+    )
+    
+    # 剔除无法匹配真实订单的流水，准备聚合
+    valid_payouts = payout_df.filter(pl.col("Target Order ID").is_not_null())
+    
+    # 构造向量化 Aggregation 表达式
+    agg_exprs = [
+        pl.col(payout_field).sum().alias(order_field)
+        for order_field, payout_field in fee_aliases.items()
+    ]
+    # 保留店铺标签
+    agg_exprs.append(pl.col("店铺").first().alias("店铺_payout"))
+    
+    payout_agg = valid_payouts.group_by("Target Order ID").agg(agg_exprs)
+    
+    return payout_agg, payout_df
+
+# ---------------------------------------------------------
+# 3. 订单读取、表连接与列级计算公式 (替代 build_order_summary)
+# ---------------------------------------------------------
+
+def build_order_pipeline(order_files: list, payout_agg_df: pl.DataFrame, cost_map_df: pl.DataFrame, 
+                         order_headers: list, extra_fee_fields: list, 
+                         tax_rate: float, exchange_rate: float, include_canceled: bool):
+    dfs = []
+    
+    for f in order_files:
+        df = pl.read_excel(f.path, engine="calamine")
+        df = clean_polars_headers(df, order_headers)
+        df = df.with_columns(pl.lit(f.store_label).alias("店铺"))
+        dfs.append(df)
+        
+    order_df = pl.concat(dfs, how="diagonal_relaxed")
+    
+    if not include_canceled:
+        order_df = order_df.filter(~pl.col("Order Status").is_in(["Canceled", "Cancelled"]))
+        
+    # 需要参与计算的字段提取为 Float64
+    financial_cols = [
+        "Quantity", "SKU Subtotal After Discount", 
+        "Shipping Fee Seller Discount", "Taxes"
+    ] + extra_fee_fields
+    
+    if "广告费" in order_df.columns:
+        financial_cols.append("广告费")
+        
+    order_df = enforce_financial_floats(order_df, financial_cols)
+    
+    # 1. 关联 SKU 成本表
+    order_df = order_df.join(cost_map_df, left_on="Seller SKU", right_on="SKU", how="left")
+    # SKU成本处理
+    order_df = order_df.with_columns([
+        pl.col("SKU成本").fill_null(0.0),
+        (pl.col("Quantity") * pl.col("SKU成本").fill_null(0.0)).alias("SKU总成本(rmb)")
+    ])
+    
+    # 2. 关联 Payout 聚合结果表
+    order_df = order_df.join(payout_agg_df, left_on="Order ID", right_on="Target Order ID", how="left")
+    
+    # 判定是否到款
+    order_df = order_df.with_columns(
+        pl.when(pl.col("Total revenue").is_not_null())
+        .then(pl.lit("是"))
+        .otherwise(pl.lit("否"))
+        .alias("是否到款")
+    )
+    
+    # 3. 向量化重算容错字段：Total revenue
+    order_df = order_df.with_columns(
+        pl.when(pl.col("Total revenue").is_null() | (pl.col("Total revenue") == 0))
+        .then(
+            pl.col("SKU Subtotal After Discount") 
+            - pl.col("Shipping Fee Seller Discount") 
+            - pl.col("Taxes")
+        )
+        .otherwise(pl.col("Total revenue"))
+        .alias("Total revenue")
+    )
+    
+    # 4. 横向累加所有平台扣费 (水平向量化加法)
+    fee_exprs = [pl.col(f).fill_null(0.0) for f in extra_fee_fields if f in order_df.columns]
+    ad_fee_expr = pl.col("广告费").fill_null(0.0) if "广告费" in order_df.columns else pl.lit(0.0)
+    
+    total_fees_expr = pl.sum_horizontal(fee_exprs + [ad_fee_expr])
+    
+    # 5. 核心财务流式计算 (依赖级联)
+    order_df = (
+        order_df
+        .with_columns([
+            total_fees_expr.alias("Total fees"),
+            (pl.col("Total revenue") + total_fees_expr).alias("结算金额"),
+        ])
+        .with_columns(
+            (pl.col("结算金额") * tax_rate).alias("税费")
+        )
+        .with_columns(
+            (pl.col("结算金额") - pl.col("税费")).alias("总计结算金额")
+        )
+        .with_columns(
+            ((pl.col("总计结算金额") / exchange_rate) - pl.col("SKU总成本(rmb)")).alias("净利润(rmb)")
+        )
+    )
+    
+    return order_df
+
+# ---------------------------------------------------------
+# 4. 高效写出 (原生集成 xlsxwriter)
+# ---------------------------------------------------------
+
+def export_to_excel(order_df: pl.DataFrame, payout_df: pl.DataFrame, output_path: Path):
+    """
+    利用 df.write_excel() 和 xlsxwriter 工作簿输出多个 Sheet，
+    保持原有的极高写入效率，替代传统逐格填写的缓慢操作。
+    """
+    with xlsxwriter.Workbook(output_path, {'strings_to_urls': False}) as workbook:
+        # Polars write_excel 支持直接挂载到指定的 xlsxwriter workbook
+        order_df.write_excel(
+            workbook=workbook,
+            worksheet="Tiktok订单完成表",
+            header_format={"bold": True, "bg_color": "#004F81BD", "font_color": "#FFFFFF", "border": 1},
+            autofit=True
+        )
+        
+        payout_df.write_excel(
+            workbook=workbook,
+            worksheet="Tiktok到款明细表",
+            header_format={"bold": True, "bg_color": "#004F81BD", "font_color": "#FFFFFF", "border": 1},
+            autofit=True
+        )

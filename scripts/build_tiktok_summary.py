@@ -50,6 +50,89 @@ ORDER_EXTRA_FEE_FIELDS = [
     "GMV Max Coupon",
 ]
 
+ORDER_SOURCE_BASE_HEADERS = [
+    "Order ID",
+    "Order Status",
+    "Order Substatus",
+    "Cancelation/Return Type",
+    "Normal or Pre-order",
+    "SKU ID",
+    "Seller SKU",
+    "Product Name",
+    "Variation",
+    "Quantity",
+    "Sku Quantity of return",
+    "SKU Unit Original Price",
+    "SKU Subtotal Before Discount",
+    "SKU Platform Discount",
+    "SKU Seller Discount",
+    "SKU Subtotal After Discount",
+    "Shipping Fee After Discount",
+    "Original Shipping Fee",
+    "Shipping Fee Seller Discount",
+    "Shipping Fee Platform Discount",
+    "Payment platform discount",
+    "Taxes",
+    "Order Amount",
+    "Order Refund Amount",
+    "Created Time",
+    "Paid Time",
+    "RTS Time",
+    "Shipped Time",
+    "Delivered Time",
+    "Cancelled Time",
+    "Cancel By",
+    "Cancel Reason",
+    "Fulfillment Type",
+    "Warehouse Name",
+    "Tracking ID",
+    "Delivery Option",
+    "Shipping Provider Name",
+    "Buyer Message",
+    "Buyer Username",
+    "Recipient",
+    "Phone #",
+    "Country",
+    "Region",
+    "Province",
+    "Municipality",
+    "Barangay",
+    "Detail Address",
+    "Additional address information",
+    "Payment Method",
+    "Weight(kg)",
+    "Product Category",
+    "Package ID",
+    "Seller Note",
+    "Checked Status",
+    "Checked Marked by",
+]
+
+ORDER_SOURCE_REFUND_REASON_POSITION = 55
+ORDER_SOURCE_RESALE_POSITION = 56
+ORDER_SOURCE_NOTE_POSITION = 57
+ORDER_OUTPUT_HEADERS = [
+    "店铺",
+    "Order ID",
+    "Order ID.1",
+    "是否到款",
+    *ORDER_SOURCE_BASE_HEADERS[1:],
+    "Total revenue",
+    "SKU成本(rmb)",
+    "SKU总成本(rmb)",
+    *ORDER_EXTRA_FEE_FIELDS,
+    "广告费",
+    "Total fees",
+    "结算金额",
+    "税费",
+    "总计结算金额",
+    "净利润(rmb)",
+    "备注",
+    "取消订单",
+    "退款原因",
+    "二次销售(0/1)",
+]
+
 DATAFRAME_CACHE_DIR_NAME = ".cache/build_tiktok_summary"
 _PANDAS_DATAFRAME_CACHE: dict[tuple[str, str, str], pd.DataFrame] = {}
 tqdm.pandas(ncols=100)
@@ -395,6 +478,24 @@ TOP_LEVEL_OWNER_MAP = {
     "汽配": "阳玲",
 }
 
+MARKETING_STORE_NAME_ALIASES = {
+    "2月份-刘林长3C": ["phoneacc", "(3c)"],
+    "2月份-刘林长工具": ["home tool"],
+    "2月份-刘林长品牌工具": ["tasktools"],
+    "2月份-廖楠户外": ["justgo sport"],
+    "2月份-廖楠品牌锅具": ["supvibe cookware"],
+    "2月份-廖楠品牌水杯": ["meecopa cup"],
+    "2月份-廖楠品牌电动工具": ["tasktool power"],
+    "2月份-徐鑫权家居": ["home_pro"],
+    "2月份-徐鑫权品牌3C": ["meegoo electronics"],
+    "2月份-徐鑫权品牌小家电": ["meevida appliances"],
+    "2月份-徐鑫权卫浴": ["bathroom space"],
+    "2月份-徐鑫权品牌智能家居": ["meegoo smarthome"],
+    "2月份-黄海镕美妆": ["beautiffly"],
+    "2月份-黄海镕小家电": ["sparchef kitchen tool"],
+    "2月份-黄海镕品牌汽配": ["meegoo cartop", "cartop"],
+}
+
 PAYOUT_ADJUSTMENT_RULES = {
     "GMV Payment for TikTok Ads": {
         "source_type": "online_ad",
@@ -608,24 +709,93 @@ def clean_id(value: object) -> str | None:
     return text
 
 
+def clean_id_series(series: pd.Series) -> pd.Series:
+    cleaned = series.astype("string").str.strip()
+    cleaned = cleaned.replace({"": pd.NA, "nan": pd.NA, "<NA>": pd.NA, "None": pd.NA})
+    cleaned = cleaned.str.replace(r"\.0$", "", regex=True)
+    return cleaned
+
+
+def normalize_dataframe_headers(df: pd.DataFrame, expected_headers: Iterable[str]) -> pd.DataFrame:
+    expected_map = {normalize_header(header): header for header in expected_headers}
+    rename_map: dict[object, str] = {}
+    for column in df.columns:
+        normalized = normalize_header(column)
+        if normalized in expected_map:
+            rename_map[column] = expected_map[normalized]
+    return df.rename(columns=rename_map)
+
+
+def read_source_dataframe(
+    path: Path,
+    *,
+    sheet_name: str | int | None = None,
+    expected_headers: Iterable[str] = (),
+    drop_first_data_row: bool = False,
+) -> pd.DataFrame:
+    read_kwargs: dict[str, object] = {"sheet_name": 0 if sheet_name is None else sheet_name}
+    if PANDAS_READ_EXCEL_ENGINE is not None:
+        read_kwargs["engine"] = PANDAS_READ_EXCEL_ENGINE
+
+    try:
+        df = pd.read_excel(path, **read_kwargs)
+    except ValueError:
+        if sheet_name is None:
+            raise
+        fallback_kwargs = dict(read_kwargs)
+        fallback_kwargs["sheet_name"] = 0
+        df = pd.read_excel(path, **fallback_kwargs)
+    except Exception:
+        if "engine" not in read_kwargs:
+            raise
+        read_kwargs.pop("engine", None)
+        try:
+            df = pd.read_excel(path, **read_kwargs)
+        except ValueError:
+            if sheet_name is None:
+                raise
+            read_kwargs["sheet_name"] = 0
+            df = pd.read_excel(path, **read_kwargs)
+
+    if drop_first_data_row and not df.empty:
+        df = df.iloc[1:].reset_index(drop=True)
+
+    if expected_headers:
+        df = normalize_dataframe_headers(df, expected_headers)
+    return df
+
+
+def ensure_dataframe_columns(df: pd.DataFrame, headers: Iterable[str]) -> pd.DataFrame:
+    result = df.copy()
+    for header in headers:
+        if header not in result.columns:
+            result[header] = None
+    return result
+
+
+def append_dataframe_rows(worksheet, dataframe: pd.DataFrame) -> None:
+    safe_df = dataframe.astype(object).where(pd.notna(dataframe), None)
+    for row in safe_df.itertuples(index=False, name=None):
+        worksheet.append(clean_row(row))
+
+
 def collect_order_ids(order_files: list[SourceFile], include_canceled: bool) -> set[str]:
     order_ids: set[str] = set()
     for source in tqdm(order_files, desc="Collect order IDs", unit="file", **PROGRESS_KWARGS):
-        ws, header_row = open_worksheet(source.path, required_headers=["Order ID", "Order Status"])
-        source_index = {normalize_header(header): idx for idx, header in enumerate(header_row)}
-        order_id_index = source_index.get(normalize_header("Order ID"))
-        status_index = source_index.get(normalize_header("Order Status"))
-        if order_id_index is None:
+        df = read_source_dataframe(
+            source.path,
+            expected_headers=["Order ID", "Order Status"],
+            drop_first_data_row=True,
+        )
+        if "Order ID" not in df.columns:
             continue
 
-        for row in ws.iter_rows(min_row=3, values_only=True):
-            order_id = clean_id(row[order_id_index] if order_id_index < len(row) else None)
-            if not order_id:
-                continue
-            order_status = row[status_index] if status_index is not None and status_index < len(row) else None
-            if not include_canceled and order_status in {"Canceled", "Cancelled"}:
-                continue
-            order_ids.add(order_id)
+        order_id_series = clean_id_series(df["Order ID"])
+        if not include_canceled and "Order Status" in df.columns:
+            valid_mask = ~df["Order Status"].isin({"Canceled", "Cancelled"})
+            order_id_series = order_id_series[valid_mask]
+
+        order_ids.update(order_id_series.dropna().tolist())
     return order_ids
 
 
@@ -884,11 +1054,62 @@ def create_store_adjustment_row(
     return clean_row(recompute_order_row(row, tax_rate, exchange_rate))
 
 
+def build_marketing_store_candidates(source: SourceFile) -> list[tuple[str, str]]:
+    month = extract_month(source.path.name) or 2
+    parent_dir = source.path.parent
+    owner = parent_dir.name.split("-", 1)[0].strip()
+    candidates: list[tuple[str, str]] = []
+    for child in parent_dir.iterdir():
+        if not child.is_dir():
+            continue
+        category = extract_category(child.name)
+        if not category:
+            continue
+        candidates.append((normalize_header(category), f"{month}月份-{owner}{category}"))
+    return sorted(candidates, key=lambda item: len(item[0]), reverse=True)
+
+
+def normalize_marketing_alias(value: object) -> str:
+    text = "" if value is None else str(value)
+    text = text.lower().replace("\n", " ")
+    text = re.sub(r"[^a-z0-9]+", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def resolve_marketing_store_label(
+    source: SourceFile,
+    worksheet_title: str,
+    project_name: object,
+    store_name: object,
+    candidates: list[tuple[str, str]],
+) -> str | None:
+    haystacks = [normalize_header(worksheet_title), normalize_header(project_name), normalize_header(store_name)]
+    for category_key, store_label in candidates:
+        if not category_key:
+            continue
+        for haystack in haystacks:
+            if category_key and category_key in haystack:
+                return store_label
+
+    alias_haystacks = [normalize_marketing_alias(project_name), normalize_marketing_alias(store_name)]
+    for _category_key, store_label in candidates:
+        aliases = MARKETING_STORE_NAME_ALIASES.get(store_label, [])
+        for alias in aliases:
+            alias_key = normalize_marketing_alias(alias)
+            if not alias_key:
+                continue
+            for haystack in alias_haystacks:
+                if alias_key and alias_key in haystack:
+                    return store_label
+    return None
+
+
 def build_marketing_store_adjustments(marketing_files: list[SourceFile]) -> list[StoreAdjustment]:
     adjustments: list[StoreAdjustment] = []
     for source in tqdm(marketing_files, desc="Scan marketing files", unit="file", **PROGRESS_KWARGS):
         workbook = load_workbook(source.path, read_only=True, data_only=True)
         month = extract_month(source.path.name) or 2
+        candidates = build_marketing_store_candidates(source)
         for worksheet in workbook.worksheets:
             if worksheet.sheet_state != "visible":
                 continue
@@ -896,45 +1117,72 @@ def build_marketing_store_adjustments(marketing_files: list[SourceFile]) -> list
             preview_rows = list(worksheet.iter_rows(min_row=1, max_row=3, values_only=True))
             if len(preview_rows) < 2:
                 continue
-
             header_row = [str(value).strip() if value is not None else "" for value in preview_rows[1]]
-            if "线下广告费金额（PHP）" not in header_row or "平台" not in header_row:
+            has_named_headers = "线下广告费金额（PHP）" in header_row and "平台" in header_row
+            if not has_named_headers and len(header_row) < 9:
                 continue
 
-            source_index = {header: idx for idx, header in enumerate(header_row)}
+            header_index = {header: idx for idx, header in enumerate(header_row) if header}
+            if has_named_headers:
+                platform_index = header_index.get("平台", 0)
+                project_index = header_index.get("项目", 3)
+                store_name_index = header_index.get("店铺名", 4)
+                offline_ad_index = header_index.get("线下广告费金额（PHP)")
+                if offline_ad_index is None:
+                    offline_ad_index = header_index.get("线下广告费金额（PHP）")
+                offline_refund_index = header_index.get("线下退款总金额（PHP）")
+            elif len(header_row) >= 10:
+                platform_index = 0
+                project_index = 3
+                store_name_index = 4
+                offline_ad_index = 5
+                offline_refund_index = 8
+            elif len(header_row) == 9:
+                platform_index = 0
+                project_index = 3
+                store_name_index = 4
+                offline_ad_index = 7
+                offline_refund_index = 8
+            else:
+                platform_index = 0
+                project_index = 2
+                store_name_index = 3
+                offline_ad_index = 4
+                offline_refund_index = 7
+
             for row in worksheet.iter_rows(min_row=3, values_only=True):
-                platform = str(row[source_index.get("平台", -1)] or "").strip()
-                if platform in {"", "合计："}:
-                    continue
-                if platform.upper() != "TK":
+                platform_value = row[platform_index] if platform_index is not None and platform_index < len(row) else None
+                if normalize_header(platform_value) != normalize_header("TK"):
                     continue
 
-                owner = str(row[source_index.get("业务员", -1)] or "").strip()
-                category = str(row[source_index.get("类目", -1)] or "").strip()
-                store_label = f"{month}月份-{owner}{category}"
+                project_name = row[project_index] if project_index is not None and project_index < len(row) else worksheet.title
+                store_name = row[store_name_index] if store_name_index is not None and store_name_index < len(row) else None
+                store_label = resolve_marketing_store_label(source, worksheet.title, project_name, store_name, candidates)
+                if not store_label:
+                    continue
 
-                offline_amount = to_number(row[source_index.get("线下广告费金额（PHP）", -1)]) or 0.0
-                if offline_amount:
+                offline_ad_amount = to_number(row[offline_ad_index]) if offline_ad_index is not None and offline_ad_index < len(row) else None
+                if offline_ad_amount not in (None, 0):
                     adjustments.append(
                         StoreAdjustment(
                             store_label=store_label,
                             month=month,
                             order_id=None,
-                            amount=-offline_amount,
+                            amount=-abs(offline_ad_amount),
                             note="线下广告费 线下退款",
                             source_file=source.path.name,
                             source_type="offline_ad",
                         )
                     )
 
-                offline_refund_amount = to_number(row[source_index.get("线下退款总金额（PHP）", -1)]) or 0.0
-                if offline_refund_amount:
+                offline_refund_amount = to_number(row[offline_refund_index]) if offline_refund_index is not None and offline_refund_index < len(row) else None
+                if offline_refund_amount not in (None, 0):
                     adjustments.append(
                         StoreAdjustment(
                             store_label=store_label,
                             month=month,
                             order_id=None,
-                            amount=offline_refund_amount,
+                            amount=abs(offline_refund_amount),
                             note="线下广告费 线下退款",
                             source_file=source.path.name,
                             source_type="offline_refund",
@@ -1848,6 +2096,9 @@ def export_comparison_workbook(
 
 def build_analysis_dataframe(order_workbook: Path, exchange_rate: float) -> pd.DataFrame:
     df = read_excel_cached(order_workbook, sheet_name="Tiktok订单完成表")
+    if "是否到款" in df.columns:
+        paid_mask = df["是否到款"].fillna("").astype(str).str.strip() == "是"
+        df = df.loc[paid_mask].copy()
     group_keys = ["店铺", "是否到款"]
     prepared = df[group_keys].copy()
     agg_map: dict[str, str | callable] = {}
@@ -2029,177 +2280,192 @@ def build_payout_summary(
     payout_sheet,
     valid_order_ids: set[str],
     original_store_lookup: dict[str, str],
-) -> tuple[dict[str, dict[str, float | str | None]], int, list[StoreAdjustment]]:
+) -> tuple[pd.DataFrame, int, list[StoreAdjustment]]:
     payout_sheet.append(clean_row(PAYOUT_HEADERS))
-    payout_index = {normalize_header(header): idx for idx, header in enumerate(PAYOUT_HEADERS[1:])}
-    aggregates: dict[str, dict[str, float | str | None]] = defaultdict(dict)
     adjustments: list[StoreAdjustment] = []
-    adjustment_candidates: dict[tuple[str, str, str], dict[str, object]] = {}
-    row_count = 0
+    payout_frames: list[pd.DataFrame] = []
 
     for source in tqdm(payout_files, desc="Summarize payout files", unit="file", **PROGRESS_KWARGS):
-        ws, header_row = open_worksheet(
+        df = read_source_dataframe(
             source.path,
-            "Order details",
-            required_headers=[
-                "Order/adjustment ID",
-                "Type",
-                "Affiliate commission deposit",
-                "Campaign resource fee",
-                "Order processing fee",
-                "Related order ID",
-            ],
+            sheet_name="Order details",
+            expected_headers=PAYOUT_HEADERS[1:],
         )
-        source_index = {normalize_header(header): idx for idx, header in enumerate(header_row)}
+        df = ensure_dataframe_columns(df, PAYOUT_HEADERS[1:])
+        df = df[PAYOUT_HEADERS[1:]].copy()
+        df.insert(0, "店铺", source.store_label)
+        df["源月份"] = extract_month(source.path.name) or 2
+        df["源文件名"] = source.path.name
+        payout_frames.append(df)
 
-        for row in ws.iter_rows(min_row=2, values_only=True):
-            combined_row = [source.store_label] + [None] * (len(PAYOUT_HEADERS) - 1)
-            row_values: dict[str, object] = {}
+    if not payout_frames:
+        empty = pd.DataFrame(columns=["Target Order ID", "店铺", *PAYOUT_FIELD_ALIASES.keys()])
+        return empty, 0, adjustments
 
-            for header in PAYOUT_HEADERS[1:]:
-                normalized = normalize_header(header)
-                source_idx = source_index.get(normalized)
-                value = row[source_idx] if source_idx is not None and source_idx < len(row) else None
-                combined_row[payout_index[normalized] + 1] = value
-                row_values[header] = value
+    payout_df = pd.concat(payout_frames, ignore_index=True, sort=False)
+    append_dataframe_rows(payout_sheet, payout_df[PAYOUT_HEADERS])
+    row_count = len(payout_df)
 
-            payout_sheet.append(clean_row(combined_row))
-            row_count += 1
+    payout_df["Type"] = payout_df["Type"].fillna("").astype(str).str.strip()
+    payout_df["Order/adjustment ID_clean"] = clean_id_series(payout_df["Order/adjustment ID"])
+    payout_df["Related order ID_clean"] = clean_id_series(payout_df["Related order ID"])
+    payout_df["Total settlement amount"] = pd.to_numeric(payout_df["Total settlement amount"], errors="coerce")
+    payout_df["Order settled time"] = pd.to_datetime(payout_df["Order settled time"], errors="coerce")
+    payout_df["Order created time"] = pd.to_datetime(payout_df["Order created time"], errors="coerce")
 
-            payout_type = str(row_values.get("Type") or "").strip()
-            rule = PAYOUT_ADJUSTMENT_RULES.get(payout_type)
-            if rule:
-                total_settlement_amount = to_number(row_values.get("Total settlement amount"))
-                adjustment_id = clean_id(row_values.get("Order/adjustment ID"))
-                source_month = extract_month(source.path.name) or 2
-                if adjustment_id and total_settlement_amount not in (None, 0):
-                    if rule["match_source_month"] and not matches_source_month(row_values, source_month):
-                        continue
-                    bucket_key = (payout_type, source.store_label, adjustment_id)
-                    bucket = adjustment_candidates.setdefault(
-                        bucket_key,
-                        {
-                            "store_label": source.store_label,
-                            "month": source_month,
-                            "order_id": adjustment_id,
-                            "amount": 0.0,
-                            "note": rule["note"],
-                            "source_file": source.path.name,
-                            "source_type": rule["source_type"],
-                            "target_header": rule["target_header"],
-                            "paid_status": rule["paid_status"],
-                        },
-                    )
-                    bucket["amount"] = float(bucket["amount"]) + float(total_settlement_amount)
-                continue
+    adjustment_rules_df = pd.DataFrame.from_dict(PAYOUT_ADJUSTMENT_RULES, orient="index")
+    payout_df = payout_df.merge(adjustment_rules_df, left_on="Type", right_index=True, how="left")
 
-            order_key = resolve_payout_order_key(row_values, valid_order_ids)
-            if not order_key:
-                continue
+    source_month_match = payout_df["Order settled time"].dt.month.eq(payout_df["源月份"])
+    source_month_match = source_month_match.fillna(payout_df["Order created time"].dt.month.eq(payout_df["源月份"]))
+    match_source_month_required = payout_df["match_source_month"].fillna(False).astype(bool)
+    adjustment_mask = payout_df["source_type"].notna()
+    adjustment_mask &= payout_df["Order/adjustment ID_clean"].notna()
+    adjustment_mask &= payout_df["Total settlement amount"].fillna(0.0) != 0
+    adjustment_mask &= (~match_source_month_required) | source_month_match.fillna(False)
 
-            bucket = aggregates[order_key]
-            bucket["店铺"] = source.store_label
-            for order_field, payout_field in PAYOUT_FIELD_ALIASES.items():
-                number = to_number(row_values.get(payout_field))
-                if number is None:
-                    continue
-                bucket[order_field] = to_number(bucket.get(order_field)) or 0.0
-                bucket[order_field] = float(bucket[order_field]) + number
-
-    grouped_candidates: dict[tuple[str, str], list[dict[str, object]]] = defaultdict(list)
-    for (payout_type, _store_label, adjustment_id), candidate in adjustment_candidates.items():
-        grouped_candidates[(payout_type, adjustment_id)].append(candidate)
-
-    for (_payout_type, adjustment_id), candidates in grouped_candidates.items():
-        chosen = choose_adjustment_store(candidates, adjustment_id, original_store_lookup)
-        adjustments.append(
-            StoreAdjustment(
-                store_label=str(chosen["store_label"]),
-                month=int(chosen["month"]),
-                order_id=str(chosen["order_id"]),
-                amount=float(chosen["amount"]),
-                note=str(chosen["note"]),
-                source_file=str(chosen["source_file"]),
-                source_type=str(chosen["source_type"]),
-                target_header=str(chosen["target_header"]),
-                paid_status=str(chosen["paid_status"]),
+    adjustment_candidates_df = payout_df.loc[adjustment_mask].copy()
+    if not adjustment_candidates_df.empty:
+        grouped_candidates_df = (
+            adjustment_candidates_df.groupby(["Type", "店铺", "Order/adjustment ID_clean"], sort=False, dropna=False)
+            .agg(
+                month=("源月份", "first"),
+                amount=("Total settlement amount", "sum"),
+                note=("note", "first"),
+                source_file=("源文件名", "first"),
+                source_type=("source_type", "first"),
+                target_header=("target_header", "first"),
+                paid_status=("paid_status", "first"),
             )
+            .reset_index()
         )
+        grouped_candidates: dict[tuple[str, str], list[dict[str, object]]] = defaultdict(list)
+        for record in grouped_candidates_df.to_dict(orient="records"):
+            grouped_candidates[(str(record["Type"]), str(record["Order/adjustment ID_clean"]))].append(
+                {
+                    "store_label": record["店铺"],
+                    "month": record["month"],
+                    "order_id": record["Order/adjustment ID_clean"],
+                    "amount": record["amount"],
+                    "note": record["note"],
+                    "source_file": record["source_file"],
+                    "source_type": record["source_type"],
+                    "target_header": record["target_header"],
+                    "paid_status": record["paid_status"],
+                }
+            )
+        for (_payout_type, adjustment_id), candidates in grouped_candidates.items():
+            chosen = choose_adjustment_store(candidates, adjustment_id, original_store_lookup)
+            adjustments.append(
+                StoreAdjustment(
+                    store_label=str(chosen["store_label"]),
+                    month=int(chosen["month"]),
+                    order_id=str(chosen["order_id"]),
+                    amount=float(chosen["amount"]),
+                    note=str(chosen["note"]),
+                    source_file=str(chosen["source_file"]),
+                    source_type=str(chosen["source_type"]),
+                    target_header=str(chosen["target_header"]),
+                    paid_status=str(chosen["paid_status"]),
+                )
+            )
 
-    return aggregates, row_count, adjustments
+    normal_df = payout_df.loc[~payout_df["Type"].isin(PAYOUT_ADJUSTMENT_RULES)].copy()
+    valid_order_id_index = pd.Index(list(valid_order_ids), dtype="string")
+    related_target = normal_df["Related order ID_clean"].where(normal_df["Related order ID_clean"].isin(valid_order_id_index))
+    adjustment_target = normal_df["Order/adjustment ID_clean"].where(normal_df["Order/adjustment ID_clean"].isin(valid_order_id_index))
+    normal_df["Target Order ID"] = related_target.fillna(adjustment_target)
+    normal_df = normal_df[normal_df["Target Order ID"].notna()].copy()
+
+    numeric_payout_fields = sorted(set(PAYOUT_FIELD_ALIASES.values()))
+    for field in numeric_payout_fields:
+        normal_df[field] = pd.to_numeric(normal_df[field], errors="coerce").fillna(0.0)
+
+    aggregation_map: dict[str, str] = {field: "sum" for field in numeric_payout_fields}
+    aggregation_map["店铺"] = "first"
+    payout_aggregates = normal_df.groupby("Target Order ID", sort=False, dropna=False).agg(aggregation_map).reset_index()
+    payout_aggregates = payout_aggregates.rename(columns={payout_field: order_field for order_field, payout_field in PAYOUT_FIELD_ALIASES.items()})
+    return payout_aggregates, row_count, adjustments
 
 
 def build_order_summary(
     order_files: list[SourceFile],
-    payout_aggregates: dict[str, dict[str, float | str | None]],
+    payout_aggregates: pd.DataFrame,
     cost_map: dict[str, float],
     tax_rate: float,
     exchange_rate: float,
     include_canceled: bool,
 ) -> list[list[object]]:
-    order_rows: list[list[object]] = []
+    order_frames: list[pd.DataFrame] = []
 
     for source in tqdm(order_files, desc="Summarize order files", unit="file", **PROGRESS_KWARGS):
-        ws, header_row = open_worksheet(source.path, required_headers=["Order ID", "Seller SKU", "Quantity"])
-        source_index = {normalize_header(header): idx for idx, header in enumerate(header_row)}
+        df = read_source_dataframe(
+            source.path,
+            expected_headers=ORDER_SOURCE_BASE_HEADERS,
+            drop_first_data_row=True,
+        )
+        if df.empty:
+            continue
+        df = ensure_dataframe_columns(df, ORDER_SOURCE_BASE_HEADERS)
+        df = df.copy()
+        df["店铺"] = source.store_label
+        df["__退款原因"] = df.iloc[:, ORDER_SOURCE_REFUND_REASON_POSITION] if len(df.columns) > ORDER_SOURCE_REFUND_REASON_POSITION else None
+        df["__二次销售"] = df.iloc[:, ORDER_SOURCE_RESALE_POSITION] if len(df.columns) > ORDER_SOURCE_RESALE_POSITION else None
+        df["__备注"] = df.iloc[:, ORDER_SOURCE_NOTE_POSITION] if len(df.columns) > ORDER_SOURCE_NOTE_POSITION else None
+        order_frames.append(df)
 
-        for row in ws.iter_rows(min_row=3, values_only=True):
-            order_id = clean_id(row[source_index[normalize_header("Order ID")]])
-            if not order_id:
-                continue
+    if not order_frames:
+        return []
 
-            order_status = row[source_index[normalize_header("Order Status")]]
-            if not include_canceled and order_status in {"Canceled", "Cancelled"}:
-                continue
+    order_df = pd.concat(order_frames, ignore_index=True, sort=False)
+    order_df["Order ID"] = clean_id_series(order_df["Order ID"])
+    order_df = order_df[order_df["Order ID"].notna()].copy()
 
-            seller_sku = clean_id(row[source_index[normalize_header("Seller SKU")]])
-            quantity = to_number(row[source_index[normalize_header("Quantity")]]) or 0.0
-            payout = payout_aggregates.get(order_id, {})
+    if not include_canceled:
+        order_df = order_df[~order_df["Order Status"].isin({"Canceled", "Cancelled"})].copy()
 
-            total_revenue = payout.get("Total revenue")
-            if total_revenue is None:
-                total_revenue = safe_sum([
-                    row[source_index[normalize_header("SKU Subtotal After Discount")]],
-                    -1 * (to_number(row[source_index[normalize_header("Shipping Fee Seller Discount")]]) or 0.0),
-                    -1 * (to_number(row[source_index[normalize_header("Taxes")]]) or 0.0),
-                ])
+    order_df["Seller SKU"] = clean_id_series(order_df["Seller SKU"])
+    order_df["Quantity"] = pd.to_numeric(order_df["Quantity"], errors="coerce").fillna(0.0)
+    order_df["SKU成本(rmb)"] = order_df["Seller SKU"].map(cost_map)
+    order_df["SKU总成本(rmb)"] = order_df["Quantity"] * order_df["SKU成本(rmb)"].fillna(0.0)
+    order_df.loc[order_df["SKU成本(rmb)"].isna(), "SKU总成本(rmb)"] = np.nan
 
-            sku_cost = cost_map.get(seller_sku) if seller_sku else None
-            total_cost = sku_cost * quantity if sku_cost is not None else None
+    payout_df = payout_aggregates.copy() if not payout_aggregates.empty else pd.DataFrame(columns=["Target Order ID", *PAYOUT_FIELD_ALIASES.keys()])
+    if "Target Order ID" in payout_df.columns:
+        payout_df["Target Order ID"] = clean_id_series(payout_df["Target Order ID"])
+    order_df = order_df.merge(payout_df, left_on="Order ID", right_on="Target Order ID", how="left", suffixes=("", "_payout"))
+    order_df["是否到款"] = np.where(order_df["Target Order ID"].notna(), "是", "否")
 
-            fee_values = [payout.get(field) for field in ORDER_EXTRA_FEE_FIELDS]
-            ad_fee = None
-            total_fees = safe_sum([*fee_values, ad_fee])
-            settled_amount = safe_sum([total_revenue, total_fees])
-            tax_fee = settled_amount * tax_rate if settled_amount is not None else None
-            final_settlement = settled_amount - tax_fee if settled_amount is not None else None
-            net_profit = (final_settlement / exchange_rate - total_cost) if final_settlement is not None and total_cost is not None else None
+    fallback_total_revenue = (
+        numeric_series(order_df, "SKU Subtotal After Discount")
+        - numeric_series(order_df, "Shipping Fee Seller Discount")
+        - numeric_series(order_df, "Taxes")
+    )
+    payout_total_revenue = pd.to_numeric(order_df.get("Total revenue"), errors="coerce")
+    order_df["Total revenue"] = payout_total_revenue.where(payout_total_revenue.notna() & (payout_total_revenue != 0), fallback_total_revenue)
 
-            source_values = list(row)
-            combined_row = [
-                source.store_label,
-                order_id,
-                order_id,
-                "是" if order_id in payout_aggregates else "否",
-                *source_values[1:55],
-                total_revenue,
-                sku_cost,
-                total_cost,
-                *fee_values,
-                ad_fee,
-                total_fees,
-                settled_amount,
-                tax_fee,
-                final_settlement,
-                net_profit,
-                source_values[57] if len(source_values) > 57 else None,
-                None,
-                source_values[55] if len(source_values) > 55 else None,
-                source_values[56] if len(source_values) > 56 else None,
-            ]
-            order_rows.append(clean_row(combined_row))
+    fee_matrix = pd.DataFrame(index=order_df.index)
+    for field in ORDER_EXTRA_FEE_FIELDS:
+        fee_matrix[field] = pd.to_numeric(order_df.get(field), errors="coerce")
+    order_df["广告费"] = np.nan
+    order_df["Total fees"] = fee_matrix.sum(axis=1, min_count=1)
+    settlement_base = pd.concat([order_df["Total revenue"], order_df["Total fees"]], axis=1)
+    order_df["结算金额"] = settlement_base.sum(axis=1, min_count=1)
+    order_df["税费"] = order_df["结算金额"] * tax_rate
+    order_df.loc[order_df["结算金额"].isna(), "税费"] = np.nan
+    order_df["总计结算金额"] = order_df["结算金额"] - order_df["税费"]
+    order_df.loc[order_df["结算金额"].isna(), "总计结算金额"] = np.nan
+    order_df["净利润(rmb)"] = order_df["总计结算金额"] / exchange_rate - order_df["SKU总成本(rmb)"]
+    order_df.loc[order_df["总计结算金额"].isna() | order_df["SKU总成本(rmb)"].isna(), "净利润(rmb)"] = np.nan
+    order_df["取消订单"] = None
+    order_df["退款原因"] = order_df["__退款原因"]
+    order_df["二次销售(0/1)"] = order_df["__二次销售"]
+    order_df["备注"] = order_df["__备注"]
+    order_df["Order ID.1"] = order_df["Order ID"]
 
-    return order_rows
+    final_df = order_df.reindex(columns=ORDER_OUTPUT_HEADERS)
+    final_df = final_df.astype(object).where(pd.notna(final_df), None)
+    return [clean_row(row) for row in final_df.itertuples(index=False, name=None)]
 
 
 def build_workbook(
