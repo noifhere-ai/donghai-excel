@@ -398,10 +398,10 @@ TOP_LEVEL_OWNER_MAP = {
 PAYOUT_ADJUSTMENT_RULES = {
     "GMV Payment for TikTok Ads": {
         "source_type": "online_ad",
-        "note": "系统重建-线上广告费",
+        "note": "广告费",
         "target_header": "广告费",
         "paid_status": "是",
-        "match_source_month": False,
+        "match_source_month": True,
     },
     "Withholding tax": {
         "source_type": "withholding_tax",
@@ -427,6 +427,13 @@ PAYOUT_ADJUSTMENT_RULES = {
     "Violation fee ��settlement fee��": {
         "source_type": "violation_fee",
         "note": "Violation fee ��settlement fee��",
+        "target_header": "Total revenue",
+        "paid_status": "否",
+        "match_source_month": True,
+    },
+    "Violation fee （settlement fee）": {
+        "source_type": "violation_fee",
+        "note": "Violation fee （settlement fee）",
         "target_header": "Total revenue",
         "paid_status": "否",
         "match_source_month": True,
@@ -914,9 +921,23 @@ def build_marketing_store_adjustments(marketing_files: list[SourceFile]) -> list
                             month=month,
                             order_id=None,
                             amount=-offline_amount,
-                            note="系统重建-线下广告费",
+                            note="线下广告费 线下退款",
                             source_file=source.path.name,
                             source_type="offline_ad",
+                        )
+                    )
+
+                offline_refund_amount = to_number(row[source_index.get("线下退款总金额（PHP）", -1)]) or 0.0
+                if offline_refund_amount:
+                    adjustments.append(
+                        StoreAdjustment(
+                            store_label=store_label,
+                            month=month,
+                            order_id=None,
+                            amount=offline_refund_amount,
+                            note="线下广告费 线下退款",
+                            source_file=source.path.name,
+                            source_type="offline_refund",
                         )
                     )
     return adjustments
@@ -1022,7 +1043,7 @@ def build_ad_import_workbook(prefill_rows: list[list[object]] | None = None) -> 
         ["字段", "说明"],
         ["颜色图例", "黄色=始终必填；橙色=分摊广告费必填；浅黄=分摊广告费可选筛选；浅蓝=新增调整行可填；浅绿=新增调整行覆盖值"],
         ["记录类型", "只允许：分摊广告费、新增调整行"],
-        ["系统默认广告费逻辑", "线上广告费默认来自到款明细表 Type=GMV Payment for TikTok Ads；线下广告费默认来自营销表可见页的线下广告费金额（PHP）；二者都按店铺级调整行写入，不拆分到订单"],
+        ["系统默认广告费逻辑", "线上广告费默认来自到款明细表 Type=GMV Payment for TikTok Ads，按结算时间落在当月时生成广告费调整行；线下广告费与线下退款默认来自营销表可见页的线下广告费金额（PHP）/线下退款总金额（PHP），按店铺级调整行写入，不拆分到订单"],
         ["新增系统调整逻辑", "Withholding tax、Platform reimbursement、Logistics reimbursement、Violation fee settlement fee 默认按店铺级 Total revenue 调整行写入；只取结算时间落在文件月份内的记录"],
         ["分摊广告费", "只用于系统未自动识别到的额外广告费场景；按店铺和筛选条件匹配真实订单，再把 分摊金额(PHP) 分摊到 广告费 列"],
         ["新增调整行", "用于补原利润表里状态为空的人工调整行；可直接填写财务列，并允许覆盖 Total fees/结算金额/税费/总计结算金额/净利润"],
@@ -1466,6 +1487,129 @@ def build_manual_adjustment_summary_df(original_workbook: Path, generated_workbo
         .rename(columns={"Total_revenue影响": "Total revenue影响"})
     )
     return summary.sort_values(["人工调整层分类", "行数", "备注"], ascending=[True, False, True], kind="stable").reset_index(drop=True)
+
+
+def build_payout_adjustment_review_df(original_workbook: Path, generated_workbook: Path) -> pd.DataFrame:
+    original_df = read_excel_cached(original_workbook, sheet_name="Tiktok订单完成表", dtype={"Order ID": str}).copy()
+    generated_df = read_excel_cached(generated_workbook, sheet_name="Tiktok订单完成表", dtype={"Order ID": str})
+    payout_df = read_excel_cached(generated_workbook, sheet_name="Tiktok到款明细表", dtype={"Order/adjustment ID": str})
+
+    original_df["原表行号"] = original_df.index + 2
+    generated_ids = set(generated_df["Order ID"].astype(str))
+    tail54_ids = set(original_df.tail(54)["Order ID"].astype(str))
+    original_order_counts = original_df["Order ID"].astype(str).value_counts()
+
+    unresolved = original_df[~original_df["Order ID"].astype(str).isin(generated_ids)].copy()
+    front20 = unresolved[~unresolved["Order ID"].astype(str).isin(tail54_ids)].copy()
+
+    if front20.empty:
+        return pd.DataFrame(
+            columns=[
+                "原表行号",
+                "店铺",
+                "Order ID",
+                "原表内重复次数",
+                "是否到款",
+                "Order Status",
+                "Total revenue",
+                "广告费",
+                "Total fees",
+                "总计结算金额",
+                "备注",
+                "程序回款表是否存在",
+                "回款Type",
+                "Related order ID",
+                "回款Total settlement amount",
+                "回款Total revenue",
+                "回款Total fees",
+                "回款Ajustment amount",
+            ]
+        )
+
+    payout_subset = payout_df.copy()
+    payout_subset["Order/adjustment ID"] = payout_subset["Order/adjustment ID"].astype(str)
+    payout_subset = payout_subset[payout_subset["Order/adjustment ID"].isin(front20["Order ID"].astype(str))].copy()
+    payout_subset = payout_subset.rename(
+        columns={
+            "Order/adjustment ID": "Order ID",
+            "Type": "回款Type",
+            "Total settlement amount": "回款Total settlement amount",
+            "Total revenue": "回款Total revenue",
+            "Total fees": "回款Total fees",
+            "Ajustment amount": "回款Ajustment amount",
+        }
+    )
+    payout_subset = payout_subset[
+        [
+            "Order ID",
+            "回款Type",
+            "Related order ID",
+            "回款Total settlement amount",
+            "回款Total revenue",
+            "回款Total fees",
+            "回款Ajustment amount",
+        ]
+    ].drop_duplicates(subset=["Order ID"], keep="first")
+
+    front20["原表内重复次数"] = front20["Order ID"].astype(str).map(original_order_counts)
+    review_df = front20.merge(payout_subset, on="Order ID", how="left")
+    review_df["程序回款表是否存在"] = review_df["回款Type"].notna()
+
+    keep_columns = [
+        "原表行号",
+        "店铺",
+        "Order ID",
+        "原表内重复次数",
+        "是否到款",
+        "Order Status",
+        "Total revenue",
+        "广告费",
+        "Total fees",
+        "总计结算金额",
+        "备注",
+        "程序回款表是否存在",
+        "回款Type",
+        "Related order ID",
+        "回款Total settlement amount",
+        "回款Total revenue",
+        "回款Total fees",
+        "回款Ajustment amount",
+    ]
+    return review_df[keep_columns].sort_values(["店铺", "原表行号"], kind="stable").reset_index(drop=True)
+
+
+def export_payout_adjustment_review_workbook(
+    output_path: Path,
+    original_workbook: Path,
+    generated_workbook: Path,
+) -> None:
+    review_df = build_payout_adjustment_review_df(original_workbook, generated_workbook)
+    summary_df = pd.DataFrame(
+        [
+            {
+                "项目": "散落20条回款调整行数",
+                "值": len(review_df),
+                "说明": "原表独有、非尾部54行、且需要单独核对的回款调整行",
+            },
+            {
+                "项目": "原表内重复订单数",
+                "值": int((review_df["原表内重复次数"].fillna(0) > 1).sum()) if not review_df.empty else 0,
+                "说明": "用于判断这20条是否可能由重复订单导致",
+            },
+            {
+                "项目": "程序回款表可回查行数",
+                "值": int(review_df["程序回款表是否存在"].fillna(False).sum()) if not review_df.empty else 0,
+                "说明": "能在程序版 Tiktok到款明细表 中直接找到对应回款记录的行数",
+            },
+        ]
+    )
+
+    workbook = Workbook()
+    workbook.remove(workbook.active)
+    write_dataframe_sheet(workbook, "00-汇总", summary_df)
+    write_dataframe_sheet(workbook, "前20条回款调整核对", review_df)
+    actual_output_path = save_workbook_with_fallback(workbook, output_path, "前20条回款调整核对表")
+    print(f"已导出前20条回款调整核对表: {actual_output_path}")
 
 
 def build_misalignment_diff_df(original_workbook: Path, generated_workbook: Path) -> pd.DataFrame:
@@ -1922,14 +2066,13 @@ def build_payout_summary(
             payout_sheet.append(clean_row(combined_row))
             row_count += 1
 
-            order_key = resolve_payout_order_key(row_values, valid_order_ids)
-            if not order_key:
-                payout_type = str(row_values.get("Type") or "").strip()
+            payout_type = str(row_values.get("Type") or "").strip()
+            rule = PAYOUT_ADJUSTMENT_RULES.get(payout_type)
+            if rule:
                 total_settlement_amount = to_number(row_values.get("Total settlement amount"))
                 adjustment_id = clean_id(row_values.get("Order/adjustment ID"))
-                rule = PAYOUT_ADJUSTMENT_RULES.get(payout_type)
                 source_month = extract_month(source.path.name) or 2
-                if rule and adjustment_id and total_settlement_amount not in (None, 0):
+                if adjustment_id and total_settlement_amount not in (None, 0):
                     if rule["match_source_month"] and not matches_source_month(row_values, source_month):
                         continue
                     bucket_key = (payout_type, source.store_label, adjustment_id)
@@ -1948,6 +2091,10 @@ def build_payout_summary(
                         },
                     )
                     bucket["amount"] = float(bucket["amount"]) + float(total_settlement_amount)
+                continue
+
+            order_key = resolve_payout_order_key(row_values, valid_order_ids)
+            if not order_key:
                 continue
 
             bucket = aggregates[order_key]
@@ -2064,6 +2211,7 @@ def build_workbook(
     pretty_workbook: Path | None,
     manual_adjustment_output: Path | None,
     comparison_output: Path | None,
+    payout_adjustment_review_output: Path | None,
     tax_rate: float,
     exchange_rate: float,
     include_canceled: bool,
@@ -2140,6 +2288,10 @@ def build_workbook(
         log_step("开始生成差异核对表")
         export_comparison_workbook(comparison_output, original_workbook, actual_output_path, pretty_workbook, manual_adjustment_df)
 
+    if original_workbook is not None and original_workbook.exists() and payout_adjustment_review_output is not None:
+        log_step("开始生成前20条回款调整核对表")
+        export_payout_adjustment_review_workbook(payout_adjustment_review_output, original_workbook, actual_output_path)
+
     print(f"已生成: {actual_output_path}")
     print(f"订单文件: {len(order_files)} 个, 汇总行数: {len(order_rows)}")
     print(f"回款文件: {len(payout_files)} 个, 汇总行数: {payout_rows}")
@@ -2148,6 +2300,7 @@ def build_workbook(
         "系统调整行: "
         f"线上广告费 {system_adjustment_stats.get('online_ad', 0)} 条, "
         f"线下广告费 {system_adjustment_stats.get('offline_ad', 0)} 条, "
+        f"线下退款 {system_adjustment_stats.get('offline_refund', 0)} 条, "
         f"Withholding tax {system_adjustment_stats.get('withholding_tax', 0)} 条, "
         f"Platform reimbursement {system_adjustment_stats.get('platform_reimbursement', 0)} 条, "
         f"Logistics reimbursement {system_adjustment_stats.get('logistics_reimbursement', 0)} 条, "
@@ -2164,6 +2317,8 @@ def build_workbook(
         print(f"已输出待人工补录调整表: {manual_adjustment_output}")
     if comparison_output is not None and original_workbook is not None and original_workbook.exists():
         print(f"已输出3和4差异核对表: {comparison_output}")
+    if payout_adjustment_review_output is not None and original_workbook is not None and original_workbook.exists():
+        print(f"已输出前20条回款调整核对表: {payout_adjustment_review_output}")
     print("说明: 当前脚本已自动处理订单、回款、SKU 成本与可选广告费导入表。默认跳过取消订单。")
 
 
@@ -2219,6 +2374,12 @@ def parse_args() -> argparse.Namespace:
         default=generated_dir / "3和4差异核对.xlsx",
         help="第3项和第4项差异核对表输出路径",
     )
+    parser.add_argument(
+        "--payout-adjustment-review-output",
+        type=Path,
+        default=generated_dir / "前20条回款调整核对.xlsx",
+        help="散落20条回款调整核对表输出路径",
+    )
     parser.add_argument("--tax-rate", type=float, default=0.011, help="税率，默认 1.1%%")
     parser.add_argument("--exchange-rate", type=float, default=8.4672, help="PHP 对 RMB 汇率")
     parser.add_argument("--include-canceled", action="store_true", help="保留取消订单")
@@ -2247,6 +2408,7 @@ def main() -> None:
         pretty_workbook=args.pretty_workbook,
         manual_adjustment_output=args.manual_adjustment_output,
         comparison_output=args.comparison_output,
+        payout_adjustment_review_output=args.payout_adjustment_review_output,
         tax_rate=args.tax_rate,
         exchange_rate=args.exchange_rate,
         include_canceled=args.include_canceled,
@@ -2255,4 +2417,7 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\n已手动中断执行（KeyboardInterrupt）。脚本本身未发生逻辑异常，可稍后重新运行。")
