@@ -969,6 +969,20 @@ def append_note(existing: object, addition: object) -> str | None:
     return f"{left}; {right}"
 
 
+def normalize_order_id_display_rows(order_rows: list[list[object]]) -> list[list[object]]:
+    seen_order_ids: dict[str, int] = {}
+    for row in order_rows:
+        primary_order_id = clean_id(row[ORDER_PRIMARY_ID_INDEX])
+        if not primary_order_id:
+            continue
+        order_status = "" if row[ORDER_COLUMN_INDEX["Order Status"]] is None else str(row[ORDER_COLUMN_INDEX["Order Status"]]).strip()
+        seen_count = seen_order_ids.get(primary_order_id, 0)
+        if seen_count > 0 or order_status == "":
+            row[ORDER_SECONDARY_ID_INDEX] = None
+        seen_order_ids[primary_order_id] = seen_count + 1
+    return order_rows
+
+
 def distribute_amount(total_amount: float, weights: list[float]) -> list[float]:
     if not weights:
         return []
@@ -1975,6 +1989,307 @@ def build_paid_status_diff_df(original_workbook: Path, generated_workbook: Path)
     return diff[keep_columns].sort_values(["店铺_原表", "Order ID"], kind="stable").reset_index(drop=True)
 
 
+ORDER_COMPARISON_KEY_COLUMNS = ["店铺", "Order ID", "SKU ID", "Seller SKU", "Product Name", "Variation", "Quantity"]
+ORDER_COMPARISON_VALUE_COLUMNS = ["Order ID.1", "是否到款", "Order Status", "备注", "Total revenue", "广告费", "Total fees", "总计结算金额", "净利润(rmb)"]
+PIVOT_COMPARE_METRICS = ["Total revenue", "广告费", "Total fees", "总计结算金额", "净利润(rmb)"]
+
+
+def prepare_order_comparison_dataframe(workbook_path: Path) -> pd.DataFrame:
+    df = read_excel_cached(workbook_path, sheet_name="Tiktok订单完成表", dtype={"Order ID": str, "Order ID.1": str}).copy()
+
+    for column in ORDER_COMPARISON_KEY_COLUMNS + ["Order ID.1", "是否到款", "Order Status", "备注"]:
+        if column in df.columns:
+            df[column] = df[column].fillna("").astype(str)
+        else:
+            df[column] = ""
+
+    for column in ["Quantity", *PIVOT_COMPARE_METRICS]:
+        if column in df.columns:
+            df[column] = pd.to_numeric(df[column], errors="coerce")
+        else:
+            df[column] = np.nan
+
+    df["__match_seq"] = df.groupby(ORDER_COMPARISON_KEY_COLUMNS, dropna=False).cumcount()
+    return df
+
+
+def build_adjustment_issue_detail_df(original_workbook: Path, generated_workbook: Path) -> pd.DataFrame:
+    original_df = prepare_order_comparison_dataframe(original_workbook)
+    generated_df = prepare_order_comparison_dataframe(generated_workbook)
+
+    adjustment_columns = ["店铺", "Order ID", "Order ID.1", "是否到款", "Order Status", "备注", "Total revenue", "广告费", "Total fees", "总计结算金额", "净利润(rmb)"]
+    original_adj = original_df[original_df["Order Status"].eq("")].copy()
+    generated_adj = generated_df[generated_df["Order Status"].eq("")].copy()
+
+    merged = original_adj.merge(
+        generated_adj,
+        on=adjustment_columns,
+        how="outer",
+        indicator=True,
+        suffixes=("_原表", "_程序"),
+    )
+    merged = merged[merged["_merge"] != "both"].copy()
+    if merged.empty:
+        return pd.DataFrame(columns=["差异来源", *adjustment_columns])
+
+    merged["差异来源"] = merged["_merge"].map({"left_only": "仅原表", "right_only": "仅程序"})
+    return merged[["差异来源", *adjustment_columns]].sort_values(["差异来源", "备注", "店铺", "Order ID"], kind="stable").reset_index(drop=True)
+
+
+def build_order_id_set_diff_df(original_workbook: Path, generated_workbook: Path) -> pd.DataFrame:
+    original_df = prepare_order_comparison_dataframe(original_workbook)
+    generated_df = prepare_order_comparison_dataframe(generated_workbook)
+
+    original_summary = (
+        original_df[original_df["Order ID"].ne("")]
+        .groupby("Order ID", dropna=False)
+        .agg(
+            店铺_原表=("店铺", first_non_empty),
+            行数_原表=("Order ID", "size"),
+            状态_原表=("Order Status", first_non_empty),
+            是否到款_原表=("是否到款", first_non_empty),
+            第二OrderID空白行数_原表=("Order ID.1", lambda s: int((s.fillna("") == "").sum())),
+        )
+        .reset_index()
+    )
+    generated_summary = (
+        generated_df[generated_df["Order ID"].ne("")]
+        .groupby("Order ID", dropna=False)
+        .agg(
+            店铺_程序=("店铺", first_non_empty),
+            行数_程序=("Order ID", "size"),
+            状态_程序=("Order Status", first_non_empty),
+            是否到款_程序=("是否到款", first_non_empty),
+            第二OrderID空白行数_程序=("Order ID.1", lambda s: int((s.fillna("") == "").sum())),
+        )
+        .reset_index()
+    )
+
+    merged = original_summary.merge(generated_summary, on="Order ID", how="outer", indicator=True)
+    merged = merged[merged["_merge"] != "both"].copy()
+    if merged.empty:
+        return pd.DataFrame(columns=["差异来源", "Order ID", "店铺_原表", "店铺_程序", "行数_原表", "行数_程序", "状态_原表", "状态_程序", "是否到款_原表", "是否到款_程序", "第二OrderID空白行数_原表", "第二OrderID空白行数_程序"])
+
+    merged["差异来源"] = merged["_merge"].map({"left_only": "仅原表", "right_only": "仅程序"})
+    keep_columns = [
+        "差异来源",
+        "Order ID",
+        "店铺_原表",
+        "店铺_程序",
+        "行数_原表",
+        "行数_程序",
+        "状态_原表",
+        "状态_程序",
+        "是否到款_原表",
+        "是否到款_程序",
+        "第二OrderID空白行数_原表",
+        "第二OrderID空白行数_程序",
+    ]
+    return merged[keep_columns].sort_values(["差异来源", "店铺_原表", "店铺_程序", "Order ID"], kind="stable").reset_index(drop=True)
+
+
+def build_status_issue_detail_df(original_workbook: Path, generated_workbook: Path) -> pd.DataFrame:
+    original_df = prepare_order_comparison_dataframe(original_workbook)
+    generated_df = prepare_order_comparison_dataframe(generated_workbook)
+
+    merge_keys = [*ORDER_COMPARISON_KEY_COLUMNS, "__match_seq"]
+    merged = original_df.merge(generated_df, on=merge_keys, how="outer", suffixes=("_原表", "_程序"), indicator=True)
+
+    status_focus = {"Shipped", "Delivered"}
+    original_status = merged["Order Status_原表"].fillna("").astype(str)
+    generated_status = merged["Order Status_程序"].fillna("").astype(str)
+    mask = original_status.isin(status_focus) | generated_status.isin(status_focus) | (original_status != generated_status)
+    diff = merged[mask].copy()
+    if diff.empty:
+        return pd.DataFrame(columns=["匹配情况", "店铺", "Order ID", "Order ID.1_原表", "Order ID.1_程序", "SKU ID", "Seller SKU", "Product Name", "Variation", "Quantity", "Order Status_原表", "Order Status_程序", "是否到款_原表", "是否到款_程序", "备注_原表", "备注_程序"])
+
+    diff["匹配情况"] = diff["_merge"].map({"both": "双方都有", "left_only": "仅原表", "right_only": "仅程序"})
+    diff["店铺"] = diff["店铺"].fillna("").astype(str)
+    keep_columns = [
+        "匹配情况",
+        "店铺",
+        "Order ID",
+        "Order ID.1_原表",
+        "Order ID.1_程序",
+        "SKU ID",
+        "Seller SKU",
+        "Product Name",
+        "Variation",
+        "Quantity",
+        "Order Status_原表",
+        "Order Status_程序",
+        "是否到款_原表",
+        "是否到款_程序",
+        "备注_原表",
+        "备注_程序",
+    ]
+    return diff[keep_columns].sort_values(["匹配情况", "店铺", "Order ID", "SKU ID"], kind="stable").reset_index(drop=True)
+
+
+def build_order_id_display_diff_df(original_workbook: Path, generated_workbook: Path) -> pd.DataFrame:
+    original_df = prepare_order_comparison_dataframe(original_workbook)
+    generated_df = prepare_order_comparison_dataframe(generated_workbook)
+
+    merge_keys = [*ORDER_COMPARISON_KEY_COLUMNS, "__match_seq"]
+    merged = original_df.merge(generated_df, on=merge_keys, how="outer", suffixes=("_原表", "_程序"), indicator=True)
+    original_display = merged["Order ID.1_原表"].fillna("").astype(str)
+    generated_display = merged["Order ID.1_程序"].fillna("").astype(str)
+    diff = merged[original_display != generated_display].copy()
+    if diff.empty:
+        return pd.DataFrame(columns=["匹配情况", "店铺", "Order ID", "SKU ID", "Seller SKU", "Product Name", "Variation", "Quantity", "Order Status_原表", "Order Status_程序", "Order ID.1_原表", "Order ID.1_程序", "原表第二OrderID是否为空", "程序第二OrderID是否为空"])
+
+    diff["匹配情况"] = diff["_merge"].map({"both": "双方都有", "left_only": "仅原表", "right_only": "仅程序"})
+    diff["店铺"] = diff["店铺"].fillna("").astype(str)
+    diff["原表第二OrderID是否为空"] = original_display.eq("")
+    diff["程序第二OrderID是否为空"] = generated_display.eq("")
+    keep_columns = [
+        "匹配情况",
+        "店铺",
+        "Order ID",
+        "SKU ID",
+        "Seller SKU",
+        "Product Name",
+        "Variation",
+        "Quantity",
+        "Order Status_原表",
+        "Order Status_程序",
+        "Order ID.1_原表",
+        "Order ID.1_程序",
+        "原表第二OrderID是否为空",
+        "程序第二OrderID是否为空",
+    ]
+    return diff[keep_columns].sort_values(["匹配情况", "店铺", "Order ID", "SKU ID"], kind="stable").reset_index(drop=True)
+
+
+def build_status_issue_focus_df(original_workbook: Path, generated_workbook: Path) -> pd.DataFrame:
+    original_df = prepare_order_comparison_dataframe(original_workbook)
+    generated_df = prepare_order_comparison_dataframe(generated_workbook)
+
+    merge_keys = [*ORDER_COMPARISON_KEY_COLUMNS, "__match_seq"]
+    merged = original_df.merge(generated_df, on=merge_keys, how="outer", suffixes=("_原表", "_程序"), indicator=True)
+    original_status = merged["Order Status_原表"].fillna("").astype(str)
+    generated_status = merged["Order Status_程序"].fillna("").astype(str)
+    focus_mask = (
+        (merged["_merge"] == "both")
+        & (
+            original_status.ne(generated_status)
+            | original_status.isin({"Shipped", "Delivered"})
+            | generated_status.isin({"Shipped", "Delivered"})
+        )
+    )
+    focus_df = merged[focus_mask].copy()
+    if focus_df.empty:
+        return pd.DataFrame(columns=["店铺", "Order ID", "SKU ID", "Seller SKU", "Product Name", "Variation", "Quantity", "Order Status_原表", "Order Status_程序", "是否到款_原表", "是否到款_程序", "Order ID.1_原表", "Order ID.1_程序"])
+
+    keep_columns = [
+        "店铺",
+        "Order ID",
+        "SKU ID",
+        "Seller SKU",
+        "Product Name",
+        "Variation",
+        "Quantity",
+        "Order Status_原表",
+        "Order Status_程序",
+        "是否到款_原表",
+        "是否到款_程序",
+        "Order ID.1_原表",
+        "Order ID.1_程序",
+    ]
+    return focus_df[keep_columns].sort_values(["店铺", "Order ID", "SKU ID"], kind="stable").reset_index(drop=True)
+
+
+def build_order_id_display_focus_df(original_workbook: Path, generated_workbook: Path) -> pd.DataFrame:
+    original_df = prepare_order_comparison_dataframe(original_workbook)
+    generated_df = prepare_order_comparison_dataframe(generated_workbook)
+
+    original_summary = (
+        original_df[original_df["Order ID"].ne("")]
+        .groupby("Order ID", dropna=False)
+        .agg(
+            店铺_原表=("店铺", first_non_empty),
+            行数_原表=("Order ID", "size"),
+            第二OrderID空白行数_原表=("Order ID.1", lambda s: int((s.fillna("") == "").sum())),
+        )
+        .reset_index()
+    )
+    generated_summary = (
+        generated_df[generated_df["Order ID"].ne("")]
+        .groupby("Order ID", dropna=False)
+        .agg(
+            店铺_程序=("店铺", first_non_empty),
+            行数_程序=("Order ID", "size"),
+            第二OrderID空白行数_程序=("Order ID.1", lambda s: int((s.fillna("") == "").sum())),
+        )
+        .reset_index()
+    )
+
+    merged = original_summary.merge(generated_summary, on="Order ID", how="outer")
+    for column in ["店铺_原表", "店铺_程序"]:
+        if column in merged.columns:
+            merged[column] = merged[column].fillna("")
+    for column in ["行数_原表", "行数_程序", "第二OrderID空白行数_原表", "第二OrderID空白行数_程序"]:
+        if column in merged.columns:
+            merged[column] = merged[column].fillna(0).astype(int)
+    merged["第二OrderID空白行数差值"] = merged["第二OrderID空白行数_程序"] - merged["第二OrderID空白行数_原表"]
+    focus_df = merged[merged["第二OrderID空白行数差值"] != 0].copy()
+    if focus_df.empty:
+        return pd.DataFrame(columns=["Order ID", "店铺_原表", "店铺_程序", "行数_原表", "行数_程序", "第二OrderID空白行数_原表", "第二OrderID空白行数_程序", "第二OrderID空白行数差值"])
+    return focus_df.sort_values(["第二OrderID空白行数差值", "Order ID"], kind="stable").reset_index(drop=True)
+
+
+def load_original_pivot_dataframe(original_workbook: Path) -> pd.DataFrame:
+    read_kwargs: dict[str, object] = {"sheet_name": "透视", "header": 2}
+    if PANDAS_READ_EXCEL_ENGINE is not None:
+        read_kwargs["engine"] = PANDAS_READ_EXCEL_ENGINE
+    try:
+        pivot_df = pd.read_excel(original_workbook, **read_kwargs).copy()
+    except Exception:
+        read_kwargs.pop("engine", None)
+        pivot_df = pd.read_excel(original_workbook, **read_kwargs).copy()
+    pivot_df = pivot_df.rename(columns=lambda value: str(value).replace("求和项:", "").strip() if pd.notna(value) else value)
+    for column in ["店铺", "是否到款"]:
+        if column in pivot_df.columns:
+            pivot_df[column] = pivot_df[column].fillna("").astype(str)
+    pivot_df = pivot_df[(pivot_df.get("店铺", "") != "") & (pivot_df.get("店铺", "") != "总计")].copy()
+    if "是否到款" in pivot_df.columns:
+        pivot_df = pivot_df[pivot_df["是否到款"].eq("是")].copy()
+    return pivot_df
+
+
+def build_original_pivot_diff_df(original_workbook: Path, generated_workbook: Path) -> pd.DataFrame:
+    original_pivot = load_original_pivot_dataframe(original_workbook)
+    generated_pivot = read_excel_cached(generated_workbook, sheet_name="透视").copy()
+
+    for df in [original_pivot, generated_pivot]:
+        for column in ["店铺", "是否到款"]:
+            if column in df.columns:
+                df[column] = df[column].fillna("").astype(str)
+        df.drop(df[df.get("店铺", "") == "总计"].index, inplace=True, errors="ignore")
+        if "是否到款" in df.columns:
+            df.drop(df[df["是否到款"] != "是"].index, inplace=True, errors="ignore")
+        for metric in PIVOT_COMPARE_METRICS:
+            if metric in df.columns:
+                df[metric] = pd.to_numeric(df[metric], errors="coerce").fillna(0.0)
+            else:
+                df[metric] = 0.0
+
+    merged = original_pivot[["店铺", "是否到款", *PIVOT_COMPARE_METRICS]].merge(
+        generated_pivot[["店铺", "是否到款", *PIVOT_COMPARE_METRICS]],
+        on=["店铺", "是否到款"],
+        how="outer",
+        suffixes=("_原表", "_程序"),
+        indicator=True,
+    ).fillna(0)
+    merged["匹配情况"] = merged["_merge"].map({"both": "双方都有", "left_only": "仅原表", "right_only": "仅程序"})
+    for metric in PIVOT_COMPARE_METRICS:
+        merged[f"{metric}_差值"] = numeric_series(merged, f"{metric}_程序") - numeric_series(merged, f"{metric}_原表")
+    keep_columns = ["店铺", "是否到款", "匹配情况"]
+    for metric in PIVOT_COMPARE_METRICS:
+        keep_columns.extend([f"{metric}_原表", f"{metric}_程序", f"{metric}_差值"])
+    return merged[keep_columns].sort_values(["匹配情况", "店铺", "是否到款"], kind="stable").reset_index(drop=True)
+
+
 def build_pivot_group_diff_df(generated_workbook: Path, pretty_workbook: Path | None) -> pd.DataFrame:
     if pretty_workbook is None or not pretty_workbook.exists():
         return pd.DataFrame(columns=["店铺", "是否到款", "匹配情况", "Total revenue_程序", "Total revenue_精美版", "广告费_程序", "广告费_精美版", "总计结算金额_程序", "总计结算金额_精美版", "净利润(rmb)_程序", "净利润(rmb)_精美版"])
@@ -2068,11 +2383,31 @@ def export_comparison_workbook(
     manual_summary_df = build_manual_adjustment_summary_df(original_workbook, generated_workbook)
     log_step("开始分析是否到款差异")
     paid_status_diff_df = build_paid_status_diff_df(original_workbook, generated_workbook)
+    log_step("开始分析调整行差异")
+    adjustment_issue_detail_df = build_adjustment_issue_detail_df(original_workbook, generated_workbook)
+    log_step("开始分析订单ID集合差异")
+    order_id_set_diff_df = build_order_id_set_diff_df(original_workbook, generated_workbook)
+    log_step("开始分析订单状态差异")
+    status_issue_detail_df = build_status_issue_detail_df(original_workbook, generated_workbook)
+    status_issue_focus_df = build_status_issue_focus_df(original_workbook, generated_workbook)
+    log_step("开始分析第二Order ID展示差异")
+    order_id_display_diff_df = build_order_id_display_diff_df(original_workbook, generated_workbook)
+    order_id_display_focus_df = build_order_id_display_focus_df(original_workbook, generated_workbook)
+    log_step("开始分析原表透视差异")
+    original_pivot_diff_df = build_original_pivot_diff_df(original_workbook, generated_workbook)
     log_step("开始分析透视分组差异")
     pivot_group_diff_df = build_pivot_group_diff_df(generated_workbook, pretty_workbook)
 
     summary_df = pd.DataFrame(
         [
+            {"项目": "问题1-调整行差异行数", "值": len(adjustment_issue_detail_df), "说明": "原表与程序版调整层按金额和备注比对后的仅单边存在行"},
+            {"项目": "问题2-Order ID集合差异数", "值": len(order_id_set_diff_df), "说明": "只在原表或只在程序版出现的 Order ID"},
+            {"项目": "问题3-订单状态差异行数", "值": len(status_issue_detail_df), "说明": "含 Shipped/Delivered 及状态不一致的逐行明细"},
+            {"项目": "问题3-订单状态差异精简行数", "值": len(status_issue_focus_df), "说明": "仅保留 Shipped/Delivered 和真实状态不一致的可操作行"},
+            {"项目": "问题4-是否到款差异订单数", "值": len(paid_status_diff_df), "说明": "同一 Order ID 在原表与程序版的是否到款不同"},
+            {"项目": "问题5-第二Order ID展示差异行数", "值": len(order_id_display_diff_df), "说明": "原表 C 列留空与程序版重复显示的差异"},
+            {"项目": "问题5-第二OrderID展示差异精简行数", "值": len(order_id_display_focus_df), "说明": "按 Order ID 汇总后的真实剩余展示差异"},
+            {"项目": "原表透视差异行数", "值": len(original_pivot_diff_df), "说明": "程序透视与原表透视按 店铺+是否到款=是 的分组差异"},
             {"项目": "第1项-人工调整观察行数", "值": len(manual_observation_df), "说明": "原表独有且程序当前未恢复的调整层，已拆成尾部54行补录和散落补录"},
             {"项目": "第2项-人工调整分类数", "值": len(manual_summary_df), "说明": "按 人工调整层分类 + 备注 汇总后的影响分组"},
             {"项目": "第3项-费用列错位差异行数", "值": len(misalignment_detail_df), "说明": "按 4 组历史错位列映射展开后的逐行差异"},
@@ -2083,6 +2418,14 @@ def export_comparison_workbook(
         ]
     )
     write_dataframe_sheet(workbook, "00-汇总", summary_df)
+    write_dataframe_sheet(workbook, "问题1-调整行差异", adjustment_issue_detail_df)
+    write_dataframe_sheet(workbook, "问题2-Order ID集合差异", order_id_set_diff_df)
+    write_dataframe_sheet(workbook, "问题3-订单状态差异", status_issue_detail_df)
+    write_dataframe_sheet(workbook, "问题3-订单状态差异_精简", status_issue_focus_df)
+    write_dataframe_sheet(workbook, "问题4-是否到款差异", paid_status_diff_df)
+    write_dataframe_sheet(workbook, "问题5-第二OrderID展示差异", order_id_display_diff_df)
+    write_dataframe_sheet(workbook, "问题5-第二OrderID展示差异_精简", order_id_display_focus_df)
+    write_dataframe_sheet(workbook, "问题6-原表透视差异", original_pivot_diff_df)
     write_dataframe_sheet(workbook, "1-人工调整观察", manual_observation_df)
     write_dataframe_sheet(workbook, "1-人工调整汇总", manual_summary_df)
     write_dataframe_sheet(workbook, "3-费用列错位差异", misalignment_detail_df)
@@ -2462,6 +2805,9 @@ def build_order_summary(
     order_df["二次销售(0/1)"] = order_df["__二次销售"]
     order_df["备注"] = order_df["__备注"]
     order_df["Order ID.1"] = order_df["Order ID"]
+    duplicate_display_mask = order_df["Order ID"].notna() & order_df.duplicated(subset=["Order ID"])
+    adjustment_display_mask = order_df["Order ID"].notna() & order_df["Order Status"].fillna("").astype(str).eq("")
+    order_df.loc[duplicate_display_mask | adjustment_display_mask, "Order ID.1"] = None
 
     final_df = order_df.reindex(columns=ORDER_OUTPUT_HEADERS)
     final_df = final_df.astype(object).where(pd.notna(final_df), None)
@@ -2530,6 +2876,7 @@ def build_workbook(
     log_step("开始读取广告费导入表")
     ad_import_df = load_ad_import(ad_import_path)
     order_rows, ad_import_stats = apply_ad_import(order_rows, ad_import_df, tax_rate, exchange_rate)
+    order_rows = normalize_order_id_display_rows(order_rows)
 
     order_sheet.append(clean_row(ORDER_HEADERS))
     for row in order_rows:
@@ -2591,6 +2938,15 @@ def build_workbook(
 def parse_args() -> argparse.Namespace:
     workspace = Path(__file__).resolve().parents[1]
     generated_dir = build_generated_dir(workspace)
+    default_original_candidates = [
+        workspace / "01-TK文件" / "2026年菲律宾2月tiktok订单利润表（1.1%）.xlsx",
+        workspace / "01-TK文件" / "2月菲律宾TK.xlsx",
+    ]
+    default_original_workbook = default_original_candidates[0]
+    for candidate in default_original_candidates:
+        if candidate.exists():
+            default_original_workbook = candidate
+            break
     parser = argparse.ArgumentParser(description="整合 TikTok 订单表和回款表，生成汇总工作簿。")
     parser.add_argument(
         "--system-dir",
@@ -2619,7 +2975,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--original-workbook",
         type=Path,
-        default=workspace / "01-TK文件" / "2026年菲律宾2月tiktok订单利润表（1.1%）.xlsx",
+        default=default_original_workbook,
         help="原利润表路径；存在时用于补重复调整归属、导出人工补录表和差异核对表",
     )
     parser.add_argument(
